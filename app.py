@@ -26,6 +26,13 @@ NOISE = {
 }
 STOP = {"and", "the", "his", "her", "with", "feat", "ft", "featuring"} | NOISE
 
+# Only strip brackets that contain noise, tags, features, or video info
+TAG_BRACKETS = re.compile(
+    r"\s*[\(\[](?:feat\.?|ft\.?|featuring|official|video|visualis|visualiz|lyric|audio|"
+    r"remaster(?:ed)?|\d{4}|live|version|edit|bonus|deluxe|mono|stereo|mix|anniversary).*?[\)\]]",
+    re.IGNORECASE
+)
+
 # Audio levels for the page background. parec records what the Pi sends to the amp.
 CAPTURE = ["parec", "--device=@DEFAULT_MONITOR@", "--format=s16le",
            "--rate=22050", "--channels=1", "--latency-msec=40"]
@@ -67,8 +74,14 @@ def player(props):
         out["status"] = p["Status"]
     if "Track" in p:
         t = {k: v.value for k, v in p["Track"].items()}
-        out.update(title=t.get("Title", ""), artist=t.get("Artist", ""),
-                   album=t.get("Album", ""),
+        artist = t.get("Artist", "")
+        title = t.get("Title", "")
+        # If artist is missing and title looks like "Artist - Title", split them
+        if not artist and " - " in title:
+            parts = title.split(" - ", 1)
+            artist, title = parts[0].strip(), parts[1].strip()
+
+        out.update(title=title, artist=artist, album=t.get("Album", ""),
                    duration=valid(t.get("Duration", 0)), position=0)
     if "Position" in p:
         out["position"] = p["Position"] if p["Position"] < MAX_MS else 0
@@ -78,8 +91,8 @@ def player(props):
 # ---- iTunes lookup: song length, album name, album art ----
 
 def clean_title(title):
-    """Strip bracketed text and trailing remaster/version suffixes for queries."""
-    t = re.sub(r"[\(\[].*?[\)\]]", " ", title)
+    """Strip only metadata/video tags and trailing remaster/version suffixes."""
+    t = TAG_BRACKETS.sub(" ", title)
     t = re.sub(
         r"\s*-\s*(?:remaster(?:ed)?|\d{4}|live|version|edit|bonus|deluxe|mono|stereo|single|radio|official|video|visualis).*$",
         " ", t, flags=re.IGNORECASE
@@ -89,18 +102,17 @@ def clean_title(title):
 
 
 def clean_artist(artist):
-    """Strip channel tags and featured artist suffixes for cleaner queries."""
+    """Extract the primary artist, removing topic channels and multi-artist lists."""
     a = re.sub(r"\s*-\s*topic\s*$", "", artist, flags=re.IGNORECASE)
-    a = re.sub(r"\s+(?:feat\.?|ft\.?|featuring)\s+.*$", "", a, flags=re.IGNORECASE)
-    a = re.sub(r"\s+", " ", a).strip()
-    return a or artist.strip()
+    # Split on commas, &, 'feat', 'ft', 'x', or '/' to isolate the primary artist
+    primary = re.split(r",|\s+(?:feat\.?|ft\.?|featuring|&|vs\.?|x)\s+|/", a, flags=re.IGNORECASE)[0]
+    return primary.strip() or artist.strip()
 
 
 def words(text):
     t = text.lower().replace("&", " and ")
-    t = re.sub(r"\s*-\s*topic\s*$", "", t)        # YouTube Music artist channels
-    t = re.sub(r"[\(\[].*?[\)\]]", " ", t)        # (Remastered), [Official Video]
-    # Strip hyphenated remaster and edition suffixes, e.g. " - 2023 Remaster"
+    t = re.sub(r"\s*-\s*topic\s*$", "", t)
+    t = TAG_BRACKETS.sub(" ", t)
     t = re.sub(
         r"\s*-\s*(?:remaster(?:ed)?|\d{4}|live|version|edit|bonus|deluxe|mono|stereo|single|radio|official|video|visualis).*$",
         " ", t
@@ -109,8 +121,13 @@ def words(text):
 
 
 def same_artist(a, b):
+    if not a or not b:
+        return True  # If Bluetooth device didn't provide artist, do not reject
     wa, wb = words(a), words(b)
-    return bool(wa and wb) and len(wa & wb) / min(len(wa), len(wb)) >= 0.6
+    if not wa or not wb:
+        return True
+    return (wa <= wb or wb <= wa or
+            (len(wa & wb) / min(len(wa), len(wb)) >= 0.5))
 
 
 def same_title(a, b):
@@ -144,7 +161,8 @@ def best_match(results, artist, title):
 
 async def itunes(term):
     async with ClientSession(timeout=ClientTimeout(total=8)) as http:
-        params = dict(term=term, entity="song", limit=10)
+        # Increased limit from 10 to 25 so album cuts aren't crowded out
+        params = dict(term=term, entity="song", limit=25)
         async with http.get(ITUNES, params=params) as r:
             return await r.json(content_type=None)
 
@@ -173,11 +191,8 @@ def choose(items, artist, title, artist_key, title_key):
 
 async def find_bandcamp(artist, title):
     c_artist, c_title = clean_artist(artist), clean_title(title)
-    data = await fetch_json(BANDCAMP, params=dict(q=f"{c_artist} {c_title}"))
+    data = await fetch_json(BANDCAMP, params=dict(q=f"{c_artist} {c_title}".strip()))
     results = data.get("results") or data.get("auto", {}).get("results", [])
-    if not results and (c_artist != artist or c_title != title):
-        data = await fetch_json(BANDCAMP, params=dict(q=f"{artist} {title}"))
-        results = data.get("results") or data.get("auto", {}).get("results", [])
     tracks = [r for r in results if r.get("type") == "t"
               and (r.get("img") or "").startswith("http")]
     r = choose(tracks, artist, title, "band_name", "name")
@@ -185,7 +200,7 @@ async def find_bandcamp(artist, title):
         return {}
     img = r["img"].replace("http://", "https://")
     return dict(duration=0, album=r.get("album_name") or "",
-                art=proxied(re.sub(r"_\d+(\.\w+)$", r"_16\1", img)),  # 700 pixels
+                art=proxied(re.sub(r"_\d+(\.\w+)$", r"_16\1", img)),
                 art_small=proxied(img))
 
 
@@ -195,7 +210,9 @@ async def find_caa(artist, title):
     clean = lambda t: re.sub(r'["\\]', " ", t)
     c_artist = clean(clean_artist(artist))
     c_title = clean(clean_title(title))
-    query = f'recording:"{c_title}" AND artist:"{c_artist}"'
+    query = f'recording:"{c_title}"'
+    if c_artist:
+        query += f' AND artist:"{c_artist}"'
     async with mb_lock:
         wait = MB_DELAY - (time.monotonic() - mb_last)
         if wait > 0:
@@ -246,21 +263,21 @@ async def guarded(name, find, artist, title):
 async def lookup(key):
     artist, title = key
     c_artist, c_title = clean_artist(artist), clean_title(title)
+    query = f"{c_artist} {c_title}".strip()
     try:
-        # Search using sanitized title/artist; fall back to raw input if empty
-        res = await itunes(f"{c_artist} {c_title}")
+        res = await itunes(query)
         results = res.get("results", [])
         if not results and (c_artist != artist or c_title != title):
-            res = await itunes(f"{artist} {title}")
+            res = await itunes(f"{artist} {title}".strip())
             results = res.get("results", [])
         meta = best_match(results, artist, title)
-    except Exception as e:  # no network: do not store, try again on the next track event
+    except Exception as e:
         print("lookup failed:", e, flush=True)
         pending.discard(key)
         return
     found = dict(duration=0, album="", art="", art_small="")
     found.update(meta)
-    if not found["art"]:    # Apple has no picture: ask the other sources
+    if not found["art"]:
         for name, find in FALLBACKS:
             extra = await guarded(name, find, artist, title)
             if extra.get("art"):
@@ -279,7 +296,8 @@ def track_key(f):
 
 
 def want_lookup(key):
-    if all(key) and key not in lookups and key not in pending:
+    # Allow lookup if at least the title exists (even if artist was omitted)
+    if key[1] and key not in lookups and key not in pending:
         pending.add(key)
         asyncio.create_task(lookup(key))
 
