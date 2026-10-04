@@ -26,8 +26,6 @@ NOISE = {
 }
 STOP = {"and", "the", "his", "her", "with", "feat", "ft", "featuring"} | NOISE
 
-# Words that show a cover, tribute or karaoke act
-COVER_WORDS = {"tribute", "performs", "performing", "plays", "covers", "cover", "karaoke"}
 # Version tags. Reject a result that has one when the wanted title has none.
 VERSION_TAG = re.compile(r"\b(?:live|remix|karaoke|instrumental|tribute|cover|acoustic|demo)\b",
                          re.IGNORECASE)
@@ -132,16 +130,21 @@ def words(text):
     return {w for w in re.findall(r"\w+", t) if w not in STOP}
 
 
+def primary(name):
+    """Words of the main artist only. Drop collaborators after a joiner."""
+    n = re.sub(r"\s*-\s*topic\s*$", "", name, flags=re.IGNORECASE)
+    n = re.split(r",|\s+(?:feat\.?|ft\.?|featuring|vs\.?|&|and)\s+|/", n,
+                 flags=re.IGNORECASE)[0]
+    return words(n)
+
+
 def same_artist(a, b):
     if not a or not b:
         return True
-    wa, wb = words(a), words(b)
-    if not wa or not wb:
+    pa, pb = primary(a), primary(b)
+    if not pa or not pb:
         return True
-    if (wa ^ wb) & COVER_WORDS:   # only one name has a tribute or cover word
-        return False
-    return (wa <= wb or wb <= wa or
-            (len(wa & wb) / min(len(wa), len(wb)) > 0.5))
+    return pa == pb
 
 
 def same_title(a, b):
@@ -348,6 +351,7 @@ async def lookup(key):
     if not found["art"]:
         for name, find in FALLBACKS:
             extra = await guarded(name, find, artist, title)
+            print(f"fallback {name}: {extra.get('album')!r}", flush=True)
             if extra.get("art"):
                 found.update(art=extra["art"], art_small=extra["art_small"])
                 found["album"] = found["album"] or extra.get("album", "")
