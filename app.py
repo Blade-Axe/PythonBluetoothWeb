@@ -18,7 +18,14 @@ COVER_ART = "https://coverartarchive.org/release-group/{}/front-{}"
 USER_AGENT = "NowPlayingPi/1.0 (https://example.com/your-contact)"
 MB_DELAY = 1.1  # seconds between MusicBrainz searches. The limit is one each second.
 UUID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
-STOP = {"and", "the", "his", "her", "with", "feat", "ft", "featuring"}
+# Noise words commonly found in video tags, remasters, and album releases
+NOISE = {
+    "remaster", "remastered", "version", "edit", "radio", "live", "bonus",
+    "deluxe", "stereo", "mono", "audio", "video", "official", "visualiser",
+    "visualizer", "original", "mix"
+}
+STOP = {"and", "the", "his", "her", "with", "feat", "ft", "featuring"} | NOISE
+
 # Audio levels for the page background. parec records what the Pi sends to the amp.
 CAPTURE = ["parec", "--device=@DEFAULT_MONITOR@", "--format=s16le",
            "--rate=22050", "--channels=1", "--latency-msec=40"]
@@ -70,10 +77,34 @@ def player(props):
 
 # ---- iTunes lookup: song length, album name, album art ----
 
+def clean_title(title):
+    """Strip bracketed text and trailing remaster/version suffixes for queries."""
+    t = re.sub(r"[\(\[].*?[\)\]]", " ", title)
+    t = re.sub(
+        r"\s*-\s*(?:remaster(?:ed)?|\d{4}|live|version|edit|bonus|deluxe|mono|stereo|single|radio|official|video|visualis).*$",
+        " ", t, flags=re.IGNORECASE
+    )
+    t = re.sub(r"\s+", " ", t).strip()
+    return t or title.strip()
+
+
+def clean_artist(artist):
+    """Strip channel tags and featured artist suffixes for cleaner queries."""
+    a = re.sub(r"\s*-\s*topic\s*$", "", artist, flags=re.IGNORECASE)
+    a = re.sub(r"\s+(?:feat\.?|ft\.?|featuring)\s+.*$", "", a, flags=re.IGNORECASE)
+    a = re.sub(r"\s+", " ", a).strip()
+    return a or artist.strip()
+
+
 def words(text):
     t = text.lower().replace("&", " and ")
     t = re.sub(r"\s*-\s*topic\s*$", "", t)        # YouTube Music artist channels
     t = re.sub(r"[\(\[].*?[\)\]]", " ", t)        # (Remastered), [Official Video]
+    # Strip hyphenated remaster and edition suffixes, e.g. " - 2023 Remaster"
+    t = re.sub(
+        r"\s*-\s*(?:remaster(?:ed)?|\d{4}|live|version|edit|bonus|deluxe|mono|stereo|single|radio|official|video|visualis).*$",
+        " ", t
+    )
     return {w for w in re.findall(r"\w+", t) if w not in STOP}
 
 
@@ -87,7 +118,7 @@ def same_title(a, b):
     if not wa or not wb:
         return False
     small, big = sorted((wa, wb), key=len)
-    return small <= big and len(small) >= 0.6 * len(big)
+    return small <= big and len(small) >= 0.5 * len(big)
 
 
 def proxied(url):
@@ -141,8 +172,12 @@ def choose(items, artist, title, artist_key, title_key):
 
 
 async def find_bandcamp(artist, title):
-    data = await fetch_json(BANDCAMP, params=dict(q=f"{artist} {title}"))
+    c_artist, c_title = clean_artist(artist), clean_title(title)
+    data = await fetch_json(BANDCAMP, params=dict(q=f"{c_artist} {c_title}"))
     results = data.get("results") or data.get("auto", {}).get("results", [])
+    if not results and (c_artist != artist or c_title != title):
+        data = await fetch_json(BANDCAMP, params=dict(q=f"{artist} {title}"))
+        results = data.get("results") or data.get("auto", {}).get("results", [])
     tracks = [r for r in results if r.get("type") == "t"
               and (r.get("img") or "").startswith("http")]
     r = choose(tracks, artist, title, "band_name", "name")
@@ -158,7 +193,9 @@ async def find_caa(artist, title):
     """MusicBrainz finds the release groups. Cover Art Archive has the pictures."""
     global mb_last
     clean = lambda t: re.sub(r'["\\]', " ", t)
-    query = f'recording:"{clean(title)}" AND artist:"{clean(artist)}"'
+    c_artist = clean(clean_artist(artist))
+    c_title = clean(clean_title(title))
+    query = f'recording:"{c_title}" AND artist:"{c_artist}"'
     async with mb_lock:
         wait = MB_DELAY - (time.monotonic() - mb_last)
         if wait > 0:
@@ -208,8 +245,15 @@ async def guarded(name, find, artist, title):
 
 async def lookup(key):
     artist, title = key
+    c_artist, c_title = clean_artist(artist), clean_title(title)
     try:
-        meta = best_match((await itunes(f"{artist} {title}")).get("results", []), artist, title)
+        # Search using sanitized title/artist; fall back to raw input if empty
+        res = await itunes(f"{c_artist} {c_title}")
+        results = res.get("results", [])
+        if not results and (c_artist != artist or c_title != title):
+            res = await itunes(f"{artist} {title}")
+            results = res.get("results", [])
+        meta = best_match(results, artist, title)
     except Exception as e:  # no network: do not store, try again on the next track event
         print("lookup failed:", e, flush=True)
         pending.discard(key)
