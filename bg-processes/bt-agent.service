@@ -1,0 +1,14 @@
+[Unit]
+Description=Bluetooth auto-pair agent
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+ExecStartPre=/usr/bin/bluetoothctl power on
+ExecStartPre=/usr/bin/bluetoothctl discoverable on
+ExecStartPre=/usr/bin/bluetoothctl pairable on
+ExecStart=/usr/bin/bt-agent -c NoInputNoOutput
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

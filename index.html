@@ -1,0 +1,451 @@
+<!doctype html>
+<meta charset="utf-8">
+<head>
+  <link rel="stylesheet" href="assets/style.css">
+  <title>Now Playing</title>
+</head>
+<canvas id="bg"></canvas>
+<main>
+  <div id="frame">
+    <!-- Material Symbols Outlined "album", 24px, weight 400, fill 0 -->
+    <svg viewBox="0 -960 960 960" aria-hidden="true"><path d="M480-300q75 0 127.5-52.5T660-480q0-75-52.5-127.5T480-660q-75 0-127.5 52.5T300-480q0 75 52.5 127.5T480-300Zm0-140q-17 0-28.5-11.5T440-480q0-17 11.5-28.5T480-520q17 0 28.5 11.5T520-480q0 17-11.5 28.5T480-440Zm0 360q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z"/></svg>
+    <img id="art" alt="">
+  </div>
+  <div id="text">
+    <div id="title"></div>
+    <div id="artist"></div>
+    <div id="album"></div>
+    <canvas id="progress"></canvas>
+    <div id="times"><span id="pos"></span><span id="dur"></span></div>
+    <div id="info"></div>
+  </div>
+  <footer>
+    <p>A 102 North Park Entertainment System</p>
+  </footer>
+</main>
+<script>
+  let s = {}, t0 = 0, lastArt = "";
+  const $ = id => document.getElementById(id);
+  const art = $("art");
+  const fmt = ms => {
+    const x = Math.floor(ms / 1000);
+    return Math.floor(x / 60) + ":" + String(x % 60).padStart(2, "0");
+  };
+
+  art.onload = () => {
+    art.classList.add("on");
+    applyPalette();
+  };
+  art.onerror = () => {
+    if (!art.dataset.tried && art.dataset.small) {
+      art.dataset.tried = "1";
+      art.src = art.dataset.small;
+    } else {
+      art.classList.remove("on");
+      useDefaultColors();
+    }
+  };
+
+  function setArt(url, small) {
+    if (url === lastArt) return;
+    lastArt = url;
+    art.classList.remove("on");
+    art.dataset.small = small;
+    delete art.dataset.tried;
+    if (url) art.src = url;
+    else useDefaultColors();
+  }
+
+  const onState = e => {
+    s = JSON.parse(e.data);
+    t0 = performance.now();
+    draw();
+  };
+  const es = new EventSource("/events");
+  es.addEventListener("state", onState);
+  es.onmessage = onState;  // an old server sends no event name
+  es.addEventListener("level", e => {
+    const d = JSON.parse(e.data);
+    onLevel(d.l, d.b);
+  });
+
+  function show(title, artist, album, pos, dur, info) {
+    $("title").textContent = title;
+    $("artist").textContent = artist;
+    $("album").textContent = album;
+    $("pos").textContent = dur || pos ? fmt(pos) : "";
+    $("dur").textContent = dur ? fmt(dur) : "";
+    $("info").textContent = info;
+  }
+
+  const posAt = now =>
+    Math.min(s.duration || Infinity, (s.position || 0) + (s.status === "playing" ? now - t0 : 0));
+
+  function draw() {
+    if (s.connected === undefined) return;
+    if (!s.connected) {
+      setArt("", "");
+      return show("Waiting for Bluetooth", "Connect to: " + s.name, "", 0, 0, "");
+    }
+    const pos = posAt(performance.now());
+    setArt(s.art || "", s.art_small || "");
+    show(s.title || "Connected", s.artist, s.album, pos, s.duration,
+         s.status + " · " + s.device);
+  }
+  setInterval(draw, 250);
+
+  // ---- Aurora background (WebGL2). Shader from React Bits "Aurora". ----
+  const COLORS = ["#d90368", "#ffbe0b", "#00b4d8"];  // used when there is no usable art
+  const BLEND = 0.5, BASE_SPEED = 0.5, RES_SCALE = 0.5, FPS = 30;
+  const COLOR_TIME = 0.8;  // seconds. A color change takes about 3 times this value.
+
+  const VERT = `#version 300 es
+in vec2 position;
+void main() {
+  gl_Position = vec4(position, 0.0, 1.0);
+}`;
+
+  const FRAG = `#version 300 es
+precision highp float;
+
+uniform float uTime;
+uniform float uAmplitude;
+uniform vec3 uColorStops[3];
+uniform vec2 uResolution;
+uniform float uBlend;
+uniform float uPulse;
+
+out vec4 fragColor;
+
+vec3 permute(vec3 x) {
+  return mod(((x * 34.0) + 1.0) * x, 289.0);
+}
+
+float snoise(vec2 v){
+  const vec4 C = vec4(
+      0.211324865405187, 0.366025403784439,
+      -0.577350269189626, 0.024390243902439
+  );
+  vec2 i  = floor(v + dot(v, C.yy));
+  vec2 x0 = v - i + dot(i, C.xx);
+  vec2 i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+  vec4 x12 = x0.xyxy + C.xxzz;
+  x12.xy -= i1;
+  i = mod(i, 289.0);
+
+  vec3 p = permute(
+      permute(i.y + vec3(0.0, i1.y, 1.0))
+    + i.x + vec3(0.0, i1.x, 1.0)
+  );
+
+  vec3 m = max(
+      0.5 - vec3(
+          dot(x0, x0),
+          dot(x12.xy, x12.xy),
+          dot(x12.zw, x12.zw)
+      ),
+      0.0
+  );
+  m = m * m;
+  m = m * m;
+
+  vec3 x = 2.0 * fract(p * C.www) - 1.0;
+  vec3 h = abs(x) - 0.5;
+  vec3 ox = floor(x + 0.5);
+  vec3 a0 = x - ox;
+  m *= 1.79284291400159 - 0.85373472095314 * (a0*a0 + h*h);
+
+  vec3 g;
+  g.x  = a0.x  * x0.x  + h.x  * x0.y;
+  g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+  return 130.0 * dot(m, g);
+}
+
+struct ColorStop {
+  vec3 color;
+  float position;
+};
+
+#define COLOR_RAMP(colors, factor, finalColor) {              \
+  int index = 0;                                            \
+  for (int i = 0; i < 2; i++) {                               \
+     ColorStop currentColor = colors[i];                    \
+     bool isInBetween = currentColor.position <= factor;    \
+     index = int(mix(float(index), float(i), float(isInBetween))); \
+  }                                                         \
+  ColorStop currentColor = colors[index];                   \
+  ColorStop nextColor = colors[index + 1];                  \
+  float range = nextColor.position - currentColor.position; \
+  float lerpFactor = (factor - currentColor.position) / range; \
+  finalColor = mix(currentColor.color, nextColor.color, lerpFactor); \
+}
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / uResolution;
+
+  ColorStop colors[3];
+  colors[0] = ColorStop(uColorStops[0], 0.0);
+  colors[1] = ColorStop(uColorStops[1], 0.5);
+  colors[2] = ColorStop(uColorStops[2], 1.0);
+
+  vec3 rampColor;
+  COLOR_RAMP(colors, uv.x, rampColor);
+
+  float height = snoise(vec2(uv.x * 2.0 + uTime * 0.1, uTime * 0.25)) * 0.5 * uAmplitude;
+  height = exp(height);
+  height = (uv.y * 2.0 - height + 0.2);
+  float intensity = 0.6 * height * (1.0 + 0.4 * uPulse);
+
+  float midPoint = 0.20;
+  float auroraAlpha = smoothstep(midPoint - uBlend * 0.5, midPoint + uBlend * 0.5, intensity);
+
+  vec3 auroraColor = intensity * rampColor;
+  fragColor = vec4(auroraColor * auroraAlpha, auroraAlpha);
+}`;
+
+  // ---- Colors from the album art ----
+  const rgb = hex => [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255);
+  const DEFAULT_STOPS = COLORS.flatMap(rgb);
+  const tgt = Float32Array.from(DEFAULT_STOPS);  // the colors that the aurora moves to
+  const tgtBar = Float32Array.from([1, 1, 1]);   // the color that the progress bar moves to. White is the default.
+
+  const toHsl = (r, g, b) => {
+    r /= 255; g /= 255; b /= 255;
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn, l = (mx + mn) / 2;
+    if (d === 0) return [0, 0, l];
+    const h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    return [(h * 60 + 360) % 360, d / (1 - Math.abs(2 * l - 1)), l];
+  };
+  const fromHsl = (h, s, l) => {
+    const c = (1 - Math.abs(2 * l - 1)) * s, hp = (((h % 360) + 360) % 360) / 60;
+    const x = c * (1 - Math.abs(hp % 2 - 1)), m = l - c / 2;
+    const [r, g, b] = [[c, x, 0], [x, c, 0], [0, c, x], [0, x, c], [x, 0, c], [c, 0, x]][Math.floor(hp) % 6];
+    return [r + m, g + m, b + m];
+  };
+  const hueGap = (a, b) => { const d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; };
+
+  // Colors from the pixels of an image (RGBA array).
+  // Returns { stops: 9 numbers for the aurora, bar: 3 numbers for the progress bar }, or null for a gray image.
+  function paletteFromPixels(d) {
+    const NB = 24;  // hue bins of 15 degrees
+    const bins = Array.from({ length: NB }, () => ({ w: 0, s: 0, l: 0, x: 0, y: 0 }));
+    let used = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] < 200) continue;
+      const [h, s, l] = toHsl(d[i], d[i + 1], d[i + 2]);
+      if (s < 0.2 || l < 0.12 || l > 0.92) continue;  // skip gray, black and white
+      const w = s * (1 - Math.abs(l - 0.5) * 1.2);    // strong, mid-light colors count most
+      const b = bins[Math.floor(h / (360 / NB)) % NB];
+      b.w += w; b.s += s * w; b.l += l * w;
+      b.x += Math.cos(h * Math.PI / 180) * w;
+      b.y += Math.sin(h * Math.PI / 180) * w;
+      used++;
+    }
+    if (used < d.length / 4 * 0.03) return null;      // less than 3% has color
+    const found = bins.filter(b => b.w > 0).map(b => ({
+      w: b.w, s: b.s / b.w, l: b.l / b.w,
+      h: (Math.atan2(b.y, b.x) * 180 / Math.PI + 360) % 360,
+    })).sort((a, b) => b.w - a.w);
+    const pick = [];
+    for (const c of found) {
+      if (pick.length === 3 || c.w < found[0].w * 0.12) break;
+      if (pick.every(p => hueGap(p.h, c.h) >= 40)) pick.push(c);
+    }
+    for (const off of [35, -35]) {  // few colors in the art: add neighbors of the main color
+      if (pick.length < 3) pick.push({ h: pick[0].h + off, s: pick[0].s, l: pick[0].l });
+    }
+    // Make them bright enough for the glow. The main color goes in the middle.
+    const out = pick.map(c => fromHsl(c.h, Math.min(0.95, Math.max(0.6, c.s)), Math.min(0.65, Math.max(0.5, c.l))));
+    // The bar color is a light tone of the main color, like a Material 3 dark theme "primary".
+    const bar = fromHsl(pick[0].h, Math.min(0.85, Math.max(0.5, pick[0].s)), 0.78);
+    return { stops: [out[1], out[0], out[2]].flat(), bar };
+  }
+
+  function applyPalette() {
+    try {
+      const n = 48, c = document.createElement("canvas");
+      c.width = c.height = n;
+      const x = c.getContext("2d", { willReadFrequently: true });
+      x.drawImage(art, 0, 0, n, n);
+      const pal = paletteFromPixels(x.getImageData(0, 0, n, n).data);
+      tgt.set(pal ? pal.stops : DEFAULT_STOPS);
+      tgtBar.set(pal ? pal.bar : [1, 1, 1]);
+    } catch (err) {
+      console.error(err);  // keep the old colors
+    }
+  }
+  function useDefaultColors() {
+    tgt.set(DEFAULT_STOPS);
+    tgtBar.set([1, 1, 1]);
+  }
+
+  // ---- Progress bar: Material 3 wavy progress indicator ----
+  // Sizes are in vh. The canvas is 3vh high.
+  const BAR = { stroke: 1.1, amp: 0.8, wave: 8, speed: 0.6, gap: 0.8, dot: 0.3 };
+  const BAR_FPS = 30;
+  const pbar = $("progress"), pctx = pbar.getContext("2d");
+  const barCur = Float32Array.from([1, 1, 1]);  // the bar color that is on the screen now
+  let barPhase = 0, barAmp = 0, barLast = 0;
+
+  function sizeBar() {
+    pbar.width = Math.max(2, Math.round(pbar.clientWidth * devicePixelRatio));
+    pbar.height = Math.max(2, Math.round(pbar.clientHeight * devicePixelRatio));
+  }
+  new ResizeObserver(sizeBar).observe(pbar);
+
+  function barFrame(now) {
+    requestAnimationFrame(barFrame);
+    if (now - barLast < 1000 / BAR_FPS - 2) return;
+    const dt = Math.min((now - barLast) / 1000, 0.1);
+    barLast = now;
+    const kc = 1 - Math.exp(-dt / COLOR_TIME);
+    for (let i = 0; i < 3; i++) barCur[i] += (tgtBar[i] - barCur[i]) * kc;  // slow color change
+
+    const W = pbar.width, H = pbar.height;
+    pctx.clearRect(0, 0, W, H);
+    if (!s.connected || !s.title || W < 8) return;
+
+    const u = H / 3, wl = BAR.wave * u, stroke = BAR.stroke * u, half = stroke / 2;
+    const known = s.duration > 0, playing = s.status === "playing";
+    const p = known ? Math.min(1, Math.max(0, posAt(now) / s.duration)) : 1;
+
+    // The wave is flat at the very start and end, and when the song is paused.
+    const ampTarget = known && (p < 0.03 || p > 0.97 || !playing) ? 0 : 1;
+    barAmp += (ampTarget - barAmp) * (1 - Math.exp(-dt / 0.3));
+    if (playing) barPhase = (barPhase + dt * BAR.speed * wl) % wl;
+
+    const cy = H / 2, A = BAR.amp * u * barAmp, k = 2 * Math.PI / wl;
+    const [r, g, b] = Array.from(barCur, v => Math.round(v * 255));
+    const solid = `rgb(${r},${g},${b})`, dim = `rgba(${r},${g},${b},.3)`;
+    pctx.lineCap = pctx.lineJoin = "round";
+    pctx.lineWidth = stroke;
+
+    const wave = (a, c) => {
+      const y = x => cy + A * Math.sin(k * (x - barPhase));
+      pctx.beginPath();
+      pctx.moveTo(a, y(a));
+      for (let x = a + 2; x < c; x += 2) pctx.lineTo(x, y(x));
+      pctx.lineTo(c, y(c));
+      pctx.stroke();
+    };
+
+    const x0 = half, x1 = W - half;  // the line ends are round: keep them inside the canvas
+    if (!known) {                    // no song length: the whole bar is wavy
+      pctx.strokeStyle = solid;
+      wave(x0, x1);
+      return;
+    }
+    const xe = x0 + p * (x1 - x0), gap = BAR.gap * stroke;
+    const ae = xe - gap / 2 - half;  // end of the wavy part
+    const ts = ae > x0 ? xe + gap / 2 + half : x0;  // start of the straight part
+    if (ae > x0) {
+      pctx.strokeStyle = solid;
+      wave(x0, ae);
+    }
+    if (ts < x1) {
+      pctx.strokeStyle = dim;
+      pctx.beginPath();
+      pctx.moveTo(ts, cy);
+      pctx.lineTo(x1, cy);
+      pctx.stroke();
+      if (ts < x1 - 2 * half) {      // the stop dot at the end of the track
+        pctx.fillStyle = solid;
+        pctx.beginPath();
+        pctx.arc(x1, cy, BAR.dot * u, 0, 2 * Math.PI);
+        pctx.fill();
+      }
+    }
+  }
+  requestAnimationFrame(barFrame);
+
+  // Music data. The Pi sends "level" events: l = loudness, b = bass, 0 to 1.
+  const lv = { l: 0, b: 0, at: -1e9, seen: false };
+  let peakL = 0.05, peakB = 0.05;  // slow auto gain: quiet and loud music both move
+  function onLevel(l, b) {
+    peakL = Math.max(peakL * 0.997, l, 0.02);
+    peakB = Math.max(peakB * 0.997, b, 0.02);
+    lv.l = l < 0.003 ? 0 : Math.min(1, l / peakL);
+    lv.b = b < 0.003 ? 0 : Math.pow(Math.min(1, b / peakB), 1.6);
+    lv.at = performance.now();
+    lv.seen = true;
+  }
+  function targets(now) {
+    if (now - lv.at < 600) return [lv.l, lv.b];
+    // No level data ever came: move at a medium level while a song plays.
+    if (!lv.seen && s.status === "playing") return [0.45, 0.3];
+    return [0, 0];
+  }
+
+  function startAurora(gl) {
+    const sh = (type, src) => {
+      const o = gl.createShader(type);
+      gl.shaderSource(o, src);
+      gl.compileShader(o);
+      if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o));
+      return o;
+    };
+    const prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VERT));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FRAG));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+
+    gl.bindVertexArray(gl.createVertexArray());
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, -1, 3, 3, -1]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, "position");
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.clearColor(0, 0, 0, 0);
+
+    const u = name => gl.getUniformLocation(prog, name);
+    const [uTime, uAmp, uPulse, uRes] = [u("uTime"), u("uAmplitude"), u("uPulse"), u("uResolution")];
+    const uStops = u("uColorStops");
+    const cur = Float32Array.from(DEFAULT_STOPS);  // the colors that the aurora shows now
+    gl.uniform1f(u("uBlend"), BLEND);
+
+    function resize() {
+      bg.width = Math.max(2, Math.round(innerWidth * RES_SCALE));
+      bg.height = Math.max(2, Math.round(innerHeight * RES_SCALE));
+      gl.viewport(0, 0, bg.width, bg.height);
+      gl.uniform2f(uRes, bg.width, bg.height);
+    }
+    addEventListener("resize", resize);
+    resize();
+
+    let last = performance.now(), phase = 0, sl = 0, sb = 0;
+    function frame(now) {
+      requestAnimationFrame(frame);
+      if (now - last < 1000 / FPS - 2) return;
+      const dt = Math.min((now - last) / 1000, 0.1);
+      last = now;
+      const [tl, tb] = targets(now);
+      sl += (tl - sl) * (1 - Math.exp(-dt / (tl > sl ? 0.08 : 0.5)));  // fast up, slow down
+      sb += (tb - sb) * (1 - Math.exp(-dt / (tb > sb ? 0.05 : 0.3)));
+      const kc = 1 - Math.exp(-dt / COLOR_TIME);
+      for (let i = 0; i < 9; i++) cur[i] += (tgt[i] - cur[i]) * kc;  // slow color change
+      gl.uniform3fv(uStops, cur);
+      phase += dt * BASE_SPEED * (0.25 + 1.75 * sl);  // louder music: faster flow
+      if (phase > 20000) phase -= 20000;              // keep the float precision
+      gl.uniform1f(uTime, phase);
+      gl.uniform1f(uAmp, 0.7 + 0.9 * sb);             // bass: taller waves
+      gl.uniform1f(uPulse, sb);                       // bass: brighter glow
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    requestAnimationFrame(frame);
+  }
+
+  const bg = $("bg");
+  try {
+    const gl = bg.getContext("webgl2", { alpha: true, premultipliedAlpha: true, antialias: false });
+    if (!gl) throw new Error("WebGL2 is not available");
+    startAurora(gl);
+  } catch (err) {
+    console.error(err);
+    bg.remove();  // the page stays black
+  }
+</script>

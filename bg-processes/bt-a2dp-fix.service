@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconnect phones when A2DP starts in a bad state
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+ExecStart=/usr/bin/python3 -u /usr/local/bin/bt-a2dp-fix.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
