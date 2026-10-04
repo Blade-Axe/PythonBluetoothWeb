@@ -26,6 +26,12 @@ NOISE = {
 }
 STOP = {"and", "the", "his", "her", "with", "feat", "ft", "featuring"} | NOISE
 
+# Words that show a cover, tribute or karaoke act
+COVER_WORDS = {"tribute", "performs", "performing", "plays", "covers", "cover", "karaoke"}
+# Version tags. Reject a result that has one when the wanted title has none.
+VERSION_TAG = re.compile(r"\b(?:live|remix|karaoke|instrumental|tribute|cover|acoustic|demo)\b",
+                         re.IGNORECASE)
+
 # Only strip brackets that contain noise, tags, features, or video info
 TAG_BRACKETS = re.compile(
     r"\s*[\(\[](?:feat\.?|ft\.?|featuring|official|video|visualis|visualiz|lyric|audio|"
@@ -132,8 +138,10 @@ def same_artist(a, b):
     wa, wb = words(a), words(b)
     if not wa or not wb:
         return True
+    if (wa ^ wb) & COVER_WORDS:   # only one name has a tribute or cover word
+        return False
     return (wa <= wb or wb <= wa or
-            (len(wa & wb) / min(len(wa), len(wb)) >= 0.5))
+            (len(wa & wb) / min(len(wa), len(wb)) > 0.5))
 
 
 def same_title(a, b):
@@ -177,6 +185,10 @@ def best_match(results, artist, title):
         # A title-only iTunes search can still be useful when the artist metadata
         # supplied by Bluetooth is slightly different.
         if not same_artist(wanted_artist, name):
+            continue
+                
+        # Reject live, remix, karaoke... when the wanted title has no such tag
+        if VERSION_TAG.search(track) and not VERSION_TAG.search(title):
             continue
         
         if words(track) == words(wanted_title):
@@ -278,7 +290,7 @@ async def find_caa(artist, title):
     return {}
 
 
-FALLBACKS = (("bandcamp", find_bandcamp), ("coverartarchive", find_caa))
+FALLBACKS = (("coverartarchive", find_caa), ("bandcamp", find_bandcamp))
 
 
 async def guarded(name, find, artist, title):
