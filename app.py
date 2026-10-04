@@ -263,7 +263,7 @@ async def find_caa(artist, title):
     # Strip parentheses for Lucene query parser
     lucene_title = re.sub(r"[\(\)\[\]]", " ", c_title)
     lucene_title = re.sub(r"\s+", " ", lucene_title).strip()
-    query = f'recording:"{lucene_title}"'
+    query = f'recording:"{lucene_title}" AND status:official'
     if c_artist:
         query += f' AND artist:"{c_artist}"'
     async with mb_lock:
@@ -272,24 +272,29 @@ async def find_caa(artist, title):
             await asyncio.sleep(wait)
         try:
             data = await fetch_json(MUSICBRAINZ, headers={"User-Agent": USER_AGENT},
-                                    params=dict(query=query, fmt="json", limit=5))
+                                    params=dict(query=query, fmt="json", limit=25))
         finally:
             mb_last = time.monotonic()
     seen = set()
     for rec in data.get("recordings", []):
-        credit = " ".join(c.get("name", "") for c in rec.get("artist-credit", []))
-        if not (same_artist(artist, credit) and same_title(title, rec.get("title", ""))):
+        credits = [c.get("name", "") for c in rec.get("artist-credit", [])]
+        if not (any(same_artist(artist, c) for c in credits)
+                and same_title(title, rec.get("title", ""))):
             continue
         for rel in rec.get("releases", []):
-            group = (rel.get("release-group") or {}).get("id", "")
+            rg = rel.get("release-group") or {}
+            group = rg.get("id", "")
             if not UUID.match(group) or group in seen:
+                continue
+            # Skip live, compilation and bootleg albums
+            if rg.get("secondary-types") or VERSION_TAG.search(rel.get("title", "")):
                 continue
             seen.add(group)
             if await head_status(COVER_ART.format(group, 500)) in (200, 301, 302, 307, 308):
                 return dict(duration=0, album=rel.get("title", ""),
                             art=proxied(COVER_ART.format(group, 500)),
                             art_small=proxied(COVER_ART.format(group, 250)))
-            if len(seen) >= 4:
+            if len(seen) >= 10:
                 return {}
     return {}
 
@@ -301,7 +306,9 @@ async def find_deezer(artist, title):
     if c_artist:
         q += f' artist:"{c_artist}"'
     data = await fetch_json(DEEZER, params=dict(q=q, limit=15))
-    if "error" in data:               # Deezer sends errors with HTTP 200
+    if "error" in data:   
+        rows = data.get("data", [])
+        print("deezer", q, [((r.get("artist") or {}).get("name"), r.get("title")) for r in rows[:10]] or str(data)[:200], flush=True)# Deezer sends errors with HTTP 200
         raise RuntimeError(data["error"])
     for r in data.get("data", []):
         name = (r.get("artist") or {}).get("name", "")
@@ -381,7 +388,7 @@ async def lookup(key):
     if not found["art"]:
         for name, find in FALLBACKS:
             extra = await guarded(name, find, artist, title)
-            print(f"fallback {name}: {extra.get('album')!r}", flush=True)
+            print(f"fallback {name}: {extra.get('album')!r} {extra.get('art')}", flush=True)
             if extra.get("art"):
                 found.update(art=extra["art"], art_small=extra["art_small"])
                 found["album"] = found["album"] or extra.get("album", "")
