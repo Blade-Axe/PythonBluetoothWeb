@@ -9,7 +9,8 @@ A2DP_SOURCE = "0000110a-0000-1000-8000-00805f9b34fb"
 DEVICE = re.compile(r"(/org/bluez/hci\d+/dev_[0-9A-F]{2}(?:_[0-9A-F]{2}){5})")
 ITUNES = "https://itunes.apple.com/search"
 # /art may fetch pictures from these hosts only: Apple, Bandcamp, Cover Art Archive
-ART_HOST = re.compile(r"^https://(?:(?:[\w-]+\.)*(?:mzstatic|bcbits)\.com|coverartarchive\.org)/")
+ART_HOST = re.compile(r"^https://(?:(?:[\w-]+\.)*(?:mzstatic|bcbits)\.com|(?:[\w-]+\.)*dzcdn\.net|coverartarchive\.org)/")
+DEEZER = "https://api.deezer.com/search"
 ART_MAX = 5_000_000  # bytes
 BANDCAMP = "https://bandcamp.com/api/fuzzysearch/1/app_autocomplete"  # not an official API
 MUSICBRAINZ = "https://musicbrainz.org/ws/2/recording"
@@ -293,7 +294,36 @@ async def find_caa(artist, title):
     return {}
 
 
-FALLBACKS = (("coverartarchive", find_caa), ("bandcamp", find_bandcamp))
+async def find_deezer(artist, title):
+    strip = lambda t: re.sub(r'["\\]', " ", t).strip()
+    c_artist, c_title = strip(clean_artist(artist)), strip(clean_title(title))
+    q = f'track:"{c_title}"'
+    if c_artist:
+        q += f' artist:"{c_artist}"'
+    data = await fetch_json(DEEZER, params=dict(q=q, limit=15))
+    if "error" in data:               # Deezer sends errors with HTTP 200
+        raise RuntimeError(data["error"])
+    for r in data.get("data", []):
+        name = (r.get("artist") or {}).get("name", "")
+        track = r.get("title", "")
+        if not same_artist(artist, name):
+            continue
+        if VERSION_TAG.search(track) and not VERSION_TAG.search(title):
+            continue
+        if not same_title(title, track):
+            continue
+        alb = r.get("album") or {}
+        big = alb.get("cover_xl") or alb.get("cover_big") or ""
+        small = alb.get("cover_medium") or big
+        if not big.startswith("https://") or "/cover//" in big:   # no real picture
+            continue
+        return dict(duration=valid(int(r.get("duration", 0)) * 1000),
+                    album=alb.get("title", ""),
+                    art=proxied(big), art_small=proxied(small))
+    return {}
+
+
+FALLBACKS = (("deezer", find_deezer), ("coverartarchive", find_caa), ("bandcamp", find_bandcamp))
 
 
 async def guarded(name, find, artist, title):
@@ -369,12 +399,20 @@ async def lookup(key):
 def track_key(f):
     return (f.get("artist", "").strip().lower(), f.get("title", "").strip().lower())
 
+async def safe_lookup(key):
+    try:
+        await lookup(key)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        pending.discard(key)
+        render()
 
 def want_lookup(key):
     # Allow lookup if at least the title exists (even if artist was omitted)
     if key[1] and key not in lookups and key not in pending:
         pending.add(key)
-        asyncio.create_task(lookup(key))
+        asyncio.create_task(safe_lookup(key))
 
 
 # ---- player and display state ----
