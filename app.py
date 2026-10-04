@@ -176,14 +176,13 @@ def best_match(results, artist, title):
         # Prefer exact title + matching artist, then close title + matching artist.
         # A title-only iTunes search can still be useful when the artist metadata
         # supplied by Bluetooth is slightly different.
-        if artist_ok and title_exact:
+        if not same_artist(wanted_artist, name):
+            continue
+        
+        if words(track) == words(wanted_title):
             score = 100
-        elif artist_ok and title_close:
+        elif same_title(wanted_title, track):
             score = 80
-        elif title_exact:
-            score = 60
-        elif title_close:
-            score = 40
         else:
             continue
 
@@ -319,17 +318,18 @@ async def lookup(key):
             queries.append(q)
 
     meta = {}
-    try:
-        for q in queries:
+    errors = 0
+    for q in queries:
+        try:
             res = await itunes(q)
-            results = res.get("results", [])
-            meta = best_match(results, artist, title)
-            if meta.get("art"):
-                break
-    except Exception as e:
-        print("lookup failed:", e, flush=True)
-        pending.discard(key)
-        return
+            print(q, [(r.get("artistName"), r.get("trackName")) for r in res.get("results", [])[:5]], flush=True)
+        except Exception as e:
+            errors += 1
+            print(f"itunes query failed ({q!r}): {e}", flush=True)
+            continue
+        meta = best_match(res.get("results", []), artist, title)
+        if meta.get("art"):
+            break
 
     found = dict(duration=0, album="", art="", art_small="")
     found.update(meta)
@@ -340,6 +340,9 @@ async def lookup(key):
                 found.update(art=extra["art"], art_small=extra["art_small"])
                 found["album"] = found["album"] or extra.get("album", "")
                 break
+            if errors and not any(found.values()):
+                pending.discard(key)
+                return
     if len(lookups) > 200:
         lookups.pop(next(iter(lookups)))
     lookups[key] = found if any(found.values()) else {}
