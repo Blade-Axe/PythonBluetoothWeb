@@ -13,9 +13,6 @@ This is a "simple" project that captures song info from incoming bluez and bluet
 - sudo apt install bluez bluez-tools libspa-0.2-bluetooth python3-venv
 - in your ~/ directory make a folder called hifi-bt-sys
 - put the app.py and index.html in the directory
-- make an /assets/ folder there as well
-    - so ~/hifi-bt-sys/assets
-- put in styles.css
 - in hifi-bt-sys run:
 - python3 -m venv venv
 - venv/bin/pip install dbus-fast aiohttp
