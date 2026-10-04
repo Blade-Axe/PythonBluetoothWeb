@@ -93,8 +93,9 @@ def player(props):
 def clean_title(title):
     """Strip only metadata/video tags and trailing remaster/version suffixes."""
     t = TAG_BRACKETS.sub(" ", title)
+    # Match standard hyphens, en-dashes, em-dashes, and minus signs
     t = re.sub(
-        r"\s*-\s*(?:remaster(?:ed)?|\d{4}|live|version|edit|bonus|deluxe|mono|stereo|single|radio|official|video|visualis).*$",
+        r"\s*[-–—−]\s*(?:remaster(?:ed)?|\d{4}|live|version|edit|bonus|deluxe|mono|stereo|single|radio|official|video|visualis).*$",
         " ", t, flags=re.IGNORECASE
     )
     t = re.sub(r"\s+", " ", t).strip()
@@ -102,11 +103,16 @@ def clean_title(title):
 
 
 def clean_artist(artist):
-    """Extract the primary artist, removing topic channels and multi-artist lists."""
+    """Extract primary artist, removing channel tags and featured artist lists."""
     a = re.sub(r"\s*-\s*topic\s*$", "", artist, flags=re.IGNORECASE)
-    # Split on commas, &, 'feat', 'ft', 'x', or '/' to isolate the primary artist
     primary = re.split(r",|\s+(?:feat\.?|ft\.?|featuring|&|vs\.?|x)\s+|/", a, flags=re.IGNORECASE)[0]
     return primary.strip() or artist.strip()
+
+
+def sanitize_query(text):
+    """Remove punctuation and parentheses so search APIs treat words as clean tokens."""
+    t = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def words(text):
@@ -114,7 +120,7 @@ def words(text):
     t = re.sub(r"\s*-\s*topic\s*$", "", t)
     t = TAG_BRACKETS.sub(" ", t)
     t = re.sub(
-        r"\s*-\s*(?:remaster(?:ed)?|\d{4}|live|version|edit|bonus|deluxe|mono|stereo|single|radio|official|video|visualis).*$",
+        r"\s*[-–—−]\s*(?:remaster(?:ed)?|\d{4}|live|version|edit|bonus|deluxe|mono|stereo|single|radio|official|video|visualis).*$",
         " ", t
     )
     return {w for w in re.findall(r"\w+", t) if w not in STOP}
@@ -122,7 +128,7 @@ def words(text):
 
 def same_artist(a, b):
     if not a or not b:
-        return True  # If Bluetooth device didn't provide artist, do not reject
+        return True
     wa, wb = words(a), words(b)
     if not wa or not wb:
         return True
@@ -139,7 +145,6 @@ def same_title(a, b):
 
 
 def proxied(url):
-    """The page loads art from this server (/art). Then it can read the colors."""
     return "/art?u=" + quote(url, safe="") if url else ""
 
 
@@ -161,7 +166,6 @@ def best_match(results, artist, title):
 
 async def itunes(term):
     async with ClientSession(timeout=ClientTimeout(total=8)) as http:
-        # Increased limit from 10 to 25 so album cuts aren't crowded out
         params = dict(term=term, entity="song", limit=25)
         async with http.get(ITUNES, params=params) as r:
             return await r.json(content_type=None)
@@ -182,7 +186,6 @@ async def head_status(url):
 
 
 def choose(items, artist, title, artist_key, title_key):
-    """The first item with the same artist. A title that is the same is the best."""
     found = [i for i in items if same_artist(artist, i.get(artist_key) or "")]
     exact = [i for i in found if words(i.get(title_key) or "") == words(title)]
     close = [i for i in found if same_title(title, i.get(title_key) or "")]
@@ -191,7 +194,8 @@ def choose(items, artist, title, artist_key, title_key):
 
 async def find_bandcamp(artist, title):
     c_artist, c_title = clean_artist(artist), clean_title(title)
-    data = await fetch_json(BANDCAMP, params=dict(q=f"{c_artist} {c_title}".strip()))
+    q = sanitize_query(f"{c_artist} {c_title}")
+    data = await fetch_json(BANDCAMP, params=dict(q=q))
     results = data.get("results") or data.get("auto", {}).get("results", [])
     tracks = [r for r in results if r.get("type") == "t"
               and (r.get("img") or "").startswith("http")]
@@ -205,12 +209,14 @@ async def find_bandcamp(artist, title):
 
 
 async def find_caa(artist, title):
-    """MusicBrainz finds the release groups. Cover Art Archive has the pictures."""
     global mb_last
     clean = lambda t: re.sub(r'["\\]', " ", t)
     c_artist = clean(clean_artist(artist))
     c_title = clean(clean_title(title))
-    query = f'recording:"{c_title}"'
+    # Strip parentheses for Lucene query parser
+    lucene_title = re.sub(r"[\(\)\[\]]", " ", c_title)
+    lucene_title = re.sub(r"\s+", " ", lucene_title).strip()
+    query = f'recording:"{lucene_title}"'
     if c_artist:
         query += f' AND artist:"{c_artist}"'
     async with mb_lock:
@@ -245,7 +251,6 @@ FALLBACKS = (("bandcamp", find_bandcamp), ("coverartarchive", find_caa))
 
 
 async def guarded(name, find, artist, title):
-    """Run one source. After 3 failures in a row the source rests for 10 minutes."""
     fails, until = broken.get(name, (0, 0.0))
     if time.time() < until:
         return {}
@@ -263,18 +268,33 @@ async def guarded(name, find, artist, title):
 async def lookup(key):
     artist, title = key
     c_artist, c_title = clean_artist(artist), clean_title(title)
-    query = f"{c_artist} {c_title}".strip()
+
+    # 1. Full clean query without punctuation (e.g. "Pink Floyd Pigs Three Different Ones")
+    q1 = sanitize_query(f"{c_artist} {c_title}")
+    # 2. Base title query (e.g. "Pink Floyd Pigs") in case the parentheses aren't in the index
+    base_title = re.sub(r"[\(\[].*?[\)\]]", " ", title)
+    q2 = sanitize_query(f"{c_artist} {base_title}")
+    # 3. Raw search as last resort
+    q3 = f"{artist} {title}".strip()
+
+    queries = []
+    for q in (q1, q2, q3):
+        if q and q not in queries:
+            queries.append(q)
+
+    meta = {}
     try:
-        res = await itunes(query)
-        results = res.get("results", [])
-        if not results and (c_artist != artist or c_title != title):
-            res = await itunes(f"{artist} {title}".strip())
+        for q in queries:
+            res = await itunes(q)
             results = res.get("results", [])
-        meta = best_match(results, artist, title)
+            meta = best_match(results, artist, title)
+            if meta.get("art"):
+                break
     except Exception as e:
         print("lookup failed:", e, flush=True)
         pending.discard(key)
         return
+
     found = dict(duration=0, album="", art="", art_small="")
     found.update(meta)
     if not found["art"]:
