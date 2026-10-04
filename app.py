@@ -300,33 +300,33 @@ async def find_caa(artist, title):
 
 
 async def find_deezer(artist, title):
-    strip = lambda t: re.sub(r'["\\]', " ", t).strip()
-    c_artist, c_title = strip(clean_artist(artist)), strip(clean_title(title))
-    q = f'track:"{c_title}"'
-    if c_artist:
-        q += f' artist:"{c_artist}"'
-    data = await fetch_json(DEEZER, params=dict(q=q, limit=15))
-    if "error" in data:   
+    c_artist, c_title = clean_artist(artist), clean_title(title)
+    queries = [f"{c_artist} {c_title}".strip(), c_title]
+    for q in dict.fromkeys(queries):          # no repeated query
+        data = await fetch_json(DEEZER, params=dict(q=q, limit=50))
+        if "error" in data:                   # Deezer sends errors with HTTP 200
+            raise RuntimeError(data["error"])
         rows = data.get("data", [])
-        print("deezer", q, [((r.get("artist") or {}).get("name"), r.get("title")) for r in rows[:10]] or str(data)[:200], flush=True)# Deezer sends errors with HTTP 200
-        raise RuntimeError(data["error"])
-    for r in data.get("data", []):
-        name = (r.get("artist") or {}).get("name", "")
-        track = r.get("title", "")
-        if not same_artist(artist, name):
-            continue
-        if VERSION_TAG.search(track) and not VERSION_TAG.search(title):
-            continue
-        if not same_title(title, track):
-            continue
-        alb = r.get("album") or {}
-        big = alb.get("cover_xl") or alb.get("cover_big") or ""
-        small = alb.get("cover_medium") or big
-        if not big.startswith("https://") or "/cover//" in big:   # no real picture
-            continue
-        return dict(duration=valid(int(r.get("duration", 0)) * 1000),
-                    album=alb.get("title", ""),
-                    art=proxied(big), art_small=proxied(small))
+        print("deezer", repr(q), len(rows),
+              [((r.get("artist") or {}).get("name"), r.get("title")) for r in rows[:5]],
+              flush=True)
+        for r in rows:
+            name = (r.get("artist") or {}).get("name", "")
+            track = r.get("title", "")
+            if not same_artist(artist, name):
+                continue
+            if VERSION_TAG.search(track) and not VERSION_TAG.search(title):
+                continue
+            if not same_title(title, track):
+                continue
+            alb = r.get("album") or {}
+            big = alb.get("cover_xl") or alb.get("cover_big") or ""
+            small = alb.get("cover_medium") or big
+            if not big.startswith("https://") or "/cover//" in big:
+                continue
+            return dict(duration=valid(int(r.get("duration", 0)) * 1000),
+                        album=alb.get("title", ""),
+                        art=proxied(big), art_small=proxied(small))
     return {}
 
 
@@ -336,6 +336,7 @@ FALLBACKS = (("deezer", find_deezer), ("coverartarchive", find_caa), ("bandcamp"
 async def guarded(name, find, artist, title):
     fails, until = broken.get(name, (0, 0.0))
     if time.time() < until:
+        print(f"{name} is resting for {int(until - time.time())} s", flush=True)
         return {}
     try:
         meta = await find(artist, title)
