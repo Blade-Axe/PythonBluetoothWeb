@@ -157,11 +157,43 @@ def meta_of(r):
 
 
 def best_match(results, artist, title):
-    found = [r for r in results if same_artist(artist, r.get("artistName", ""))]
-    exact = [r for r in found if words(r.get("trackName", "")) == words(title)]
-    close = [r for r in found if same_title(title, r.get("trackName", ""))]
-    pick = (exact + close)[:1]
-    return meta_of(pick[0]) if pick else {}
+    """Pick the best artwork-bearing iTunes result without requiring one exact query form."""
+    candidates = []
+    wanted_artist = clean_artist(artist)
+    wanted_title = clean_title(title)
+
+    for r in results:
+        name = r.get("artistName", "")
+        track = r.get("trackName", "")
+        art = r.get("artworkUrl100", "")
+        if not art or not track:
+            continue
+
+        artist_ok = same_artist(wanted_artist, name)
+        title_exact = words(track) == words(wanted_title)
+        title_close = same_title(wanted_title, track)
+
+        # Prefer exact title + matching artist, then close title + matching artist.
+        # A title-only iTunes search can still be useful when the artist metadata
+        # supplied by Bluetooth is slightly different.
+        if artist_ok and title_exact:
+            score = 100
+        elif artist_ok and title_close:
+            score = 80
+        elif title_exact:
+            score = 60
+        elif title_close:
+            score = 40
+        else:
+            continue
+
+        candidates.append((score, r))
+
+    if not candidates:
+        return {}
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return meta_of(candidates[0][1])
 
 
 async def itunes(term):
@@ -269,16 +301,20 @@ async def lookup(key):
     artist, title = key
     c_artist, c_title = clean_artist(artist), clean_title(title)
 
-    # 1. Full clean query without punctuation (e.g. "Pink Floyd Pigs Three Different Ones")
+    # Try several iTunes query shapes. Some catalogue entries are indexed
+    # differently from the metadata exposed by Bluetooth (especially titles
+    # containing parentheses).
     q1 = sanitize_query(f"{c_artist} {c_title}")
-    # 2. Base title query (e.g. "Pink Floyd Pigs") in case the parentheses aren't in the index
     base_title = re.sub(r"[\(\[].*?[\)\]]", " ", title)
     q2 = sanitize_query(f"{c_artist} {base_title}")
-    # 3. Raw search as last resort
-    q3 = f"{artist} {title}".strip()
+    # Title-only search is important: it lets iTunes find the track even when
+    # the Bluetooth artist string differs from Apple's artist credit.
+    q3 = sanitize_query(c_title)
+    # Raw search is the final form, preserving punctuation and credits.
+    q4 = f"{artist} {title}".strip()
 
     queries = []
-    for q in (q1, q2, q3):
+    for q in (q1, q2, q3, q4):
         if q and q not in queries:
             queries.append(q)
 
