@@ -9,11 +9,13 @@ A2DP_SOURCE = "0000110a-0000-1000-8000-00805f9b34fb"
 DEVICE = re.compile(r"(/org/bluez/hci\d+/dev_[0-9A-F]{2}(?:_[0-9A-F]{2}){5})")
 ITUNES = "https://itunes.apple.com/search"
 # /art may fetch pictures from these hosts only: Apple, Bandcamp, Cover Art Archive
-ART_HOST = re.compile(r"^https://(?:(?:[\w-]+\.)*(?:mzstatic|bcbits)\.com|(?:[\w-]+\.)*dzcdn\.net|coverartarchive\.org)/")
+ART_HOST = re.compile(r"^https://(?:(?:[\w-]+\.)*(?:mzstatic|bcbits)\.com|(?:[\w-]+\.)*dzcdn\.net|i\.discogs\.com|coverartarchive\.org)/")
 DEEZER = "https://api.deezer.com/search"
 ART_MAX = 5_000_000  # bytes
 BANDCAMP = "https://bandcamp.com/api/fuzzysearch/1/app_autocomplete"  # not an official API
 MUSICBRAINZ = "https://musicbrainz.org/ws/2/recording"
+DISCOGS = "https://api.discogs.com"
+DISCOGS_TOKEN = ""   # paste your Discogs token between the quotes
 COVER_ART = "https://coverartarchive.org/release-group/{}/front-{}"
 # MusicBrainz asks for a contact in the User-Agent. Put your own e-mail address or web page here.
 USER_AGENT = "NowPlayingPi/1.0 (https://example.com/your-contact)"
@@ -55,6 +57,13 @@ hist = {}       # player path -> duration history, for the stale check
 active = None   # player path that the TV shows
 art_cache = {}  # image URL -> (content type, bytes)
 lookups = {}    # (artist, title) -> data from iTunes. {} means "not found"
+hints = {}      # (artist, title) -> album name from the phone
+MIN_SCORE = 70  # lower scores are rejected
+SPIN_OFF = re.compile(
+    r"soundtrack|motion picture|original score|\bost\b|music from|dj[- ]kicks|"
+    r"greatest hits|best of|\bhits\b|collection|compilation|essentials|anthology|"
+    r"\bmix(?:es)?\b|\bvarious\b", re.IGNORECASE)
+SINGLE = re.compile(r"-\s*(?:single|ep)\s*$", re.IGNORECASE)
 pending = set() # lookups that run now
 broken = {}     # source name -> (failures in a row, skip until). A failing source rests.
 mb_lock = asyncio.Lock()
@@ -168,7 +177,21 @@ def meta_of(r):
                 art_small=proxied(art))
 
 
-def best_match(results, artist, title):
+def album_score(hint, collection, collection_artist, artist_name):
+    """Bonus for the album that the phone names. Penalty for compilations and singles."""
+    if hint and collection and (words(hint) == words(collection) or same_title(hint, collection)):
+        return 20
+    adj = 0
+    if SPIN_OFF.search(collection):
+        adj -= 40
+    if collection_artist and not same_artist(artist_name, collection_artist):
+        adj -= 40       # for example "Various Artists"
+    if SINGLE.search(collection):
+        adj -= 10
+    return adj
+
+
+def best_match(results, artist, title, album=""):
     """Pick the best artwork-bearing iTunes result without requiring one exact query form."""
     candidates = []
     wanted_artist = clean_artist(artist)
@@ -202,7 +225,10 @@ def best_match(results, artist, title):
         else:
             continue
 
-        candidates.append((score, r))
+        score += album_score(album, r.get("collectionName", ""),
+                             r.get("collectionArtistName", ""), name)
+        if score >= MIN_SCORE:
+            candidates.append((score, r))
 
     if not candidates:
         return {}
@@ -300,6 +326,7 @@ async def find_caa(artist, title):
 
 
 async def find_deezer(artist, title):
+    album_hint = hints.get((artist, title), "")
     c_artist, c_title = clean_artist(artist), clean_title(title)
     queries = [f"{c_artist} {c_title}".strip(), c_title]
     for q in dict.fromkeys(queries):          # no repeated query
@@ -310,6 +337,7 @@ async def find_deezer(artist, title):
         print("deezer", repr(q), len(rows),
               [((r.get("artist") or {}).get("name"), r.get("title")) for r in rows[:5]],
               flush=True)
+        best = None
         for r in rows:
             name = (r.get("artist") or {}).get("name", "")
             track = r.get("title", "")
@@ -317,20 +345,68 @@ async def find_deezer(artist, title):
                 continue
             if VERSION_TAG.search(track) and not VERSION_TAG.search(title):
                 continue
-            if not same_title(title, track):
+            if words(track) == words(c_title):
+                score = 100
+            elif same_title(title, track):
+                score = 80
+            else:
                 continue
             alb = r.get("album") or {}
+            score += album_score(album_hint, alb.get("title", ""), "", name)
             big = alb.get("cover_xl") or alb.get("cover_big") or ""
-            small = alb.get("cover_medium") or big
-            if not big.startswith("https://") or "/cover//" in big:
+            if score < MIN_SCORE or not big.startswith("https://") or "/cover//" in big:
                 continue
+            if best is None or score > best[0]:
+                best = (score, r, alb, big)
+        if best:
+            _, r, alb, big = best
+            small = alb.get("cover_medium") or big
             return dict(duration=valid(int(r.get("duration", 0)) * 1000),
                         album=alb.get("title", ""),
                         art=proxied(big), art_small=proxied(small))
     return {}
 
 
-FALLBACKS = (("deezer", find_deezer), ("coverartarchive", find_caa), ("bandcamp", find_bandcamp))
+def discogs_artist(name):
+    name = name.split(" - ", 1)[0]
+    return re.sub(r"\s*\(\d+\)\s*$", "", name).replace("*", "").strip()
+
+
+async def find_discogs(artist, title):
+    if not DISCOGS_TOKEN:
+        return {}
+    headers = {"User-Agent": USER_AGENT, "Authorization": f"Discogs token={DISCOGS_TOKEN}"}
+    # A re-upload often has the channel as artist and "Artist - Song (HD)" as title.
+    pairs = [(clean_artist(artist), title)]
+    if " - " in title:
+        a, t = title.split(" - ", 1)
+        pairs.insert(0, (clean_artist(a), t))
+    for p_artist, p_title in pairs:
+        if not p_artist:
+            continue
+        track = clean_title(re.sub(r"\s*[\(\[]\s*(?:hd|hq|4k|1080p|720p|audio|lyrics?)\s*[\)\]]",
+                                   " ", p_title, flags=re.IGNORECASE))
+        for kind in ("master", "release"):
+            data = await fetch_json(f"{DISCOGS}/database/search", headers=headers,
+                                    params=dict(artist=p_artist, track=track, type=kind, per_page=5))
+            for r in data.get("results", [])[:3]:
+                if not r.get("resource_url") or not same_artist(p_artist, discogs_artist(r.get("title", ""))):
+                    continue
+                detail = await fetch_json(r["resource_url"], headers=headers)
+                if not any(same_title(track, t.get("title", "")) for t in detail.get("tracklist", [])):
+                    continue
+                images = detail.get("images") or []
+                img = next((i for i in images if i.get("type") == "primary"),
+                           images[0] if images else {})
+                big = img.get("uri", "")
+                if not big.startswith("https://") or "spacer.gif" in big:
+                    continue
+                return dict(duration=0, album=detail.get("title", ""), art=proxied(big),
+                            art_small=proxied(img.get("uri150") or big))
+    return {}
+
+
+FALLBACKS = (("deezer", find_deezer), ("coverartarchive", find_caa),("bandcamp", find_bandcamp), ("discogs", find_discogs))
 
 
 async def guarded(name, find, artist, title):
@@ -380,7 +456,7 @@ async def lookup(key):
             errors += 1
             print(f"itunes query failed ({q!r}): {e}", flush=True)
             continue
-        meta = best_match(res.get("results", []), artist, title)
+        meta = best_match(res.get("results", []), artist, title, hints.get(key, ""))
         if meta.get("art"):
             break
 
@@ -464,6 +540,7 @@ def update_player(path, props):
         h["cur"] = f["duration"]
         # The same duration to the millisecond as the song before: BlueZ kept the old value
         f["stale"] = bool(f["duration"]) and f["duration"] == h["prev"]
+        hints[key] = f.get("album", "")
         want_lookup(key)
 
 
