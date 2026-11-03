@@ -132,7 +132,7 @@ function draw() {
   updateColors();
   if (!s.connected) {
     setArt("", "");
-    return show("Waiting for Bluetooth", "Connect to " + s.name, "", 0, 0, "");
+    return show("Waiting for Bluetooth", "Connect to: " + s.name, "", 0, 0, "");
   }
   const pos = posAt(performance.now());
   setArt(s.art || "", s.art_small || "");
@@ -271,41 +271,92 @@ const fromHsl = (h, s, l) => {
 };
 const hueGap = (a, b) => { const d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; };
 
+// ---- OKLab: distances in OKLab are close to what people see ----
+const lin = v => (v /= 255) <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+const gam = v => 255 * (v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055);
+function toLab(r, g, b) {
+  r = lin(r); g = lin(g); b = lin(b);
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  return [0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+          1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+          0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s];
+}
+function fromLab(L, a, b) {
+  const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3;
+  return [gam(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+          gam(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+          gam(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)]
+    .map(v => Math.min(255, Math.max(0, v)));
+}
+
 // Colors from the pixels of an image (RGBA array).
 // Returns { stops: 9 numbers for the aurora, bar: 3 numbers for the progress bar },
 // or null when the image has no usable pixels (all black or very dark).
 function paletteFromPixels(d) {
-  const NB = 24;  // hue bins of 15 degrees
-  const bins = Array.from({ length: NB }, () => ({ w: 0, s: 0, l: 0, x: 0, y: 0 }));
-  const NL = 8;   // lightness bins for gray and white pixels: 0.2 to 1.0, 0.1 each
+  const COLOR_MIN = 0.02;   // share of pixels that must have color, or the art counts as gray
+  const CHROMA_MIN = 0.04;  // OKLab chroma. White, gray and cream are below this value.
+  const K = 6;              // number of color groups
+  const NL = 8;             // lightness bins for gray and white pixels
   const tones = Array.from({ length: NL }, () => ({ n: 0, r: 0, g: 0, b: 0 }));
-  let used = 0, grays = 0;
+  const cells = new Map();  // coarse OKLab cells: one cell holds nearby colors
+  let colored = 0, grays = 0;
   for (let i = 0; i < d.length; i += 4) {
     if (d[i + 3] < 200) continue;
-    const [h, s, l] = toHsl(d[i], d[i + 1], d[i + 2]);
-    const chroma = (Math.max(d[i], d[i + 1], d[i + 2]) - Math.min(d[i], d[i + 1], d[i + 2])) / 255;
-    if (chroma < 0.1 || s < 0.2) {              // gray, white, or almost no color
-      if (l < 0.2) continue;                    // black and very dark gray are skipped
-      const t = tones[Math.min(NL - 1, Math.floor((l - 0.2) / 0.1))];
+    const [L, a, b] = toLab(d[i], d[i + 1], d[i + 2]);
+    if (L < 0.2) continue;                              // black and very dark: skipped
+    if (Math.hypot(a, b) < CHROMA_MIN) {                // gray, white, or almost no color
+      const t = tones[Math.min(NL - 1, Math.floor((L - 0.2) / 0.1))];
       t.n++; t.r += d[i]; t.g += d[i + 1]; t.b += d[i + 2];
       grays++;
       continue;
     }
-    if (l < 0.12) continue;                     // very dark color
-    const w = s * (1 - Math.abs(l - 0.5) * 1.2);  // strong, mid-light colors count most
-    const b = bins[Math.floor(h / (360 / NB)) % NB];
-    b.w += w; b.s += s * w; b.l += l * w;
-    b.x += Math.cos(h * Math.PI / 180) * w;
-    b.y += Math.sin(h * Math.PI / 180) * w;
-    used++;
+    const key = Math.round(L * 12) * 10000 + Math.round(a * 30) * 100 + Math.round(b * 30);
+    const c = cells.get(key) || { n: 0, L: 0, a: 0, b: 0 };
+    c.n++; c.L += L; c.a += a; c.b += b;
+    cells.set(key, c);
+    colored++;
   }
   const total = d.length / 4;
-  if (grays > used && grays >= total * 0.03) return grayPalette(tones);  // mostly gray or white
-  if (used < total * 0.03) return null;
-  const found = bins.filter(b => b.w > 0).map(b => ({
-    w: b.w, s: b.s / b.w, l: b.l / b.w,
-    h: (Math.atan2(b.y, b.x) * 180 / Math.PI + 360) % 360,
-  })).sort((a, b) => b.w - a.w);
+  if (colored < total * COLOR_MIN) {                    // colors are a marginal part of the art
+    return grays >= total * 0.03 ? grayPalette(tones) : null;
+  }
+
+  // k-means on the cells. Each cell counts as many times as it has pixels.
+  const pts = [...cells.values()].map(c => ({ n: c.n, p: [c.L / c.n, c.a / c.n, c.b / c.n] }));
+  const dist = (p, q) => (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2;
+  const k = Math.min(K, pts.length);
+  const centers = [pts.reduce((m, q) => (q.n > m.n ? q : m)).p.slice()];
+  while (centers.length < k) {                          // start far from the centers we have
+    let best = null, bestV = -1;
+    for (const q of pts) {
+      const v = q.n * Math.min(...centers.map(c => dist(q.p, c)));
+      if (v > bestV) { bestV = v; best = q; }
+    }
+    centers.push(best.p.slice());
+  }
+  let groups = [];
+  for (let it = 0; it < 12; it++) {
+    groups = centers.map(() => ({ n: 0, s: [0, 0, 0] }));
+    for (const q of pts) {
+      let bi = 0, bd = Infinity;
+      centers.forEach((c, i) => { const v = dist(q.p, c); if (v < bd) { bd = v; bi = i; } });
+      const g = groups[bi];
+      g.n += q.n;
+      for (let j = 0; j < 3; j++) g.s[j] += q.p[j] * q.n;
+    }
+    groups.forEach((g, i) => { if (g.n) centers[i] = g.s.map(v => v / g.n); });
+  }
+
+  // Score = size x chroma. Pale tints that are almost white count less.
+  const found = groups.filter(g => g.n).map(g => {
+    const [L, a, b] = g.s.map(v => v / g.n);
+    const [h, s, l] = toHsl(...fromLab(L, a, b));
+    return { w: g.n * Math.hypot(a, b) * (L > 0.92 ? 0.3 : 1), h, s, l };
+  }).sort((x, y) => y.w - x.w);
   const pick = [];
   for (const c of found) {
     if (pick.length === 3 || c.w < found[0].w * 0.12) break;
@@ -314,9 +365,7 @@ function paletteFromPixels(d) {
   for (const off of [35, -35]) {  // few colors in the art: add neighbors of the main color
     if (pick.length < 3) pick.push({ h: pick[0].h + off, s: pick[0].s, l: pick[0].l });
   }
-  // Make them bright enough for the glow. The main color goes in the middle.
   const out = pick.map(c => fromHsl(c.h, Math.min(0.95, Math.max(0.6, c.s)), Math.min(0.65, Math.max(0.5, c.l))));
-  // The bar color is a light tone of the main color, like a Material 3 dark theme "primary".
   const bar = fromHsl(pick[0].h, Math.min(0.85, Math.max(0.5, pick[0].s)), 0.78);
   return { stops: [out[1], out[0], out[2]].flat(), bar };
 }
@@ -369,10 +418,12 @@ function updateColors() {
 
 function applyPalette() {
   try {
-    const n = 48, c = document.createElement("canvas");
+    const n = 96, c = document.createElement("canvas");
     c.width = c.height = n;
     const x = c.getContext("2d", { willReadFrequently: true });
+    x.imageSmoothingQuality = "high";
     x.drawImage(art, 0, 0, n, n);
+
     const pal = paletteFromPixels(x.getImageData(0, 0, n, n).data);
     if (pal) {
       tgt.set(pal.stops);
@@ -421,7 +472,7 @@ function barFrame(now) {
   const p = known ? Math.min(1, Math.max(0, posAt(now) / s.duration)) : 1;
 
   // The wave is flat at the very start and end, and when the song is paused.
-  const ampTarget = known && (p < 0.03 || p > 0.97 || !playing) ? 0 : 1;
+  const ampTarget = known && (p < 0.03 || p > 0.99 || !playing) ? 0 : 1;
   barAmp += (ampTarget - barAmp) * (1 - Math.exp(-dt / 0.3));
   if (playing) barPhase = (barPhase + dt * BAR.speed * wl) % wl;
 

@@ -15,7 +15,7 @@ ART_MAX = 5_000_000  # bytes
 BANDCAMP = "https://bandcamp.com/api/fuzzysearch/1/app_autocomplete"  # not an official API
 MUSICBRAINZ = "https://musicbrainz.org/ws/2/recording"
 DISCOGS = "https://api.discogs.com"
-DISCOGS_TOKEN = ""   # paste your Discogs token between the quotes
+DISCOGS_TOKEN = "gyLmWBhfEtIzLyXcZPYYGokZVTjZtkmpfJbFCQlZ"   # paste your Discogs token between the quotes
 COVER_ART = "https://coverartarchive.org/release-group/{}/front-{}"
 # MusicBrainz asks for a contact in the User-Agent. Put your own e-mail address or web page here.
 USER_AGENT = "NowPlayingPi/1.0 (https://example.com/your-contact)"
@@ -68,6 +68,8 @@ pending = set() # lookups that run now
 broken = {}     # source name -> (failures in a row, skip until). A failing source rests.
 mb_lock = asyncio.Lock()
 mb_last = 0.0   # time of the last MusicBrainz search
+# Spotify adds "• Recommended for you" or "• Video available" to the artist name.
+SPOTIFY_TAG = re.compile(r"\s*[•·●∙⋅‧]\s*(?:Recommended for you|Video available|Lyrics available).*$",re.IGNORECASE)
 
 
 def push(name="state", data=None):
@@ -81,6 +83,11 @@ def valid(ms):
     return ms if isinstance(ms, int) and 0 < ms < MAX_MS else 0
 
 
+def strip_spotify_tag(text):
+    """Remove a dot symbol and all text after it."""
+    return SPOTIFY_TAG.sub("", text).strip() or text.strip()
+
+
 def player(props):
     p = {k: v.value for k, v in props.items()}
     out = {}
@@ -88,7 +95,7 @@ def player(props):
         out["status"] = p["Status"]
     if "Track" in p:
         t = {k: v.value for k, v in p["Track"].items()}
-        artist = t.get("Artist", "")
+        artist = strip_spotify_tag(t.get("Artist", ""))
         title = t.get("Title", "")
         # If artist is missing and title looks like "Artist - Title", split them
         if not artist and " - " in title:
@@ -636,7 +643,7 @@ async def art_proxy(request):
         art_cache[url] = (ctype, body)
     ctype, body = art_cache[url]
     return web.Response(body=body, headers={
-        "Content-Type": ctype, "Cache-Control": "max-age=86400"})
+        "Content-Type": ctype, "Cache-Control": "no-store"})
 
 
 async def index(request):
