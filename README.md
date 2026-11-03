@@ -6,6 +6,7 @@ This is a "simple" project that captures song info from incoming bluez and bluet
 - A RaspberryPi running desktop RaspberryPiOS Trixie
 - An internet connection
 - A Bluetooth connection (using bluez)
+- a discogs personal access token
 
 ## Setup:
 - run:
@@ -33,6 +34,8 @@ This is a "simple" project that captures song info from incoming bluez and bluet
 - Create ~/.config/labwc/autostart
 - "$HOME/hifi-bt-sys/venv/bin/python" "$HOME/hifi-bt-sys/app.py" &
 sh -c 'sleep 5; chromium --kiosk --noerrdialogs --disable-infobars http://localhost:8080' &
+- put your discogs personal access token at the top of app.py where it says DISCOGS_TOKEN
+- save
 - sudo reboot
 
 should all work now
