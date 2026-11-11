@@ -15,10 +15,9 @@ ART_MAX = 5_000_000  # bytes
 BANDCAMP = "https://bandcamp.com/api/fuzzysearch/1/app_autocomplete"  # not an official API
 MUSICBRAINZ = "https://musicbrainz.org/ws/2/recording"
 DISCOGS = "https://api.discogs.com"
-DISCOGS_TOKEN = "gyLmWBhfEtIzLyXcZPYYGokZVTjZtkmpfJbFCQlZ"   # paste your Discogs token between the quotes
+DISCOGS_TOKEN = "" #REMEMBER TO NOT PUT YOUR API KEY HERE!!! its in the .env
 COVER_ART = "https://coverartarchive.org/release-group/{}/front-{}"
-# MusicBrainz asks for a contact in the User-Agent. Put your own e-mail address or web page here.
-USER_AGENT = "NowPlayingPi/1.0 (https://example.com/your-contact)"
+USER_AGENT = "NowPlayingPi/1.0 (https://bladeaxe.com/)"
 MB_DELAY = 1.1  # seconds between MusicBrainz searches. The limit is one each second.
 UUID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 # Noise words commonly found in video tags, remasters, and album releases
